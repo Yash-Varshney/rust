@@ -6,6 +6,7 @@ use crate::ty::{self, SubstsRef, Ty, TyCtxt, TypeFoldable};
 use rustc_hir::def::Namespace;
 use rustc_hir::def_id::{CrateNum, DefId};
 use rustc_macros::HashStable;
+use rustc_span::sym;
 use rustc_target::spec::abi::Abi;
 
 use std::fmt;
@@ -40,6 +41,11 @@ pub enum InstanceDef<'tcx> {
 
     /// `<fn() as FnTrait>::call_*`
     /// `DefId` is `FnTrait::call_*`.
+    ///
+    /// NB: the (`fn` pointer) type must be monomorphic for MIR shims to work.
+    // FIXME(eddyb) support generating shims for a "shallow type",
+    // e.g. `fn(_, _) -> _` instead of requiring a fully monomorphic
+    // `fn(Foo, Bar) -> Baz` etc.
     FnPtrShim(DefId, Ty<'tcx>),
 
     /// `<dyn Trait as Trait>::fn`, "direct calls" of which are implicitly
@@ -55,9 +61,19 @@ pub enum InstanceDef<'tcx> {
     },
 
     /// `drop_in_place::<T>; None` for empty drop glue.
+    ///
+    /// NB: the type must be monomorphic for MIR shims to work.
+    // FIXME(eddyb) support generating shims for a "shallow type",
+    // e.g. `Foo<_>` or `[_]` instead of requiring a fully monomorphic
+    // `Foo<Bar>` or `[String]` etc.
     DropGlue(DefId, Option<Ty<'tcx>>),
 
     ///`<T as Clone>::clone` shim.
+    ///
+    /// NB: the type must be monomorphic for MIR shims to work.
+    // FIXME(eddyb) support generating shims for a "shallow type",
+    // e.g. `Foo<_>` or `[_]` instead of requiring a fully monomorphic
+    // `Foo<Bar>` or `[String]` etc.
     CloneShim(DefId, Ty<'tcx>),
 }
 
@@ -282,20 +298,27 @@ impl<'tcx> Instance<'tcx> {
                     debug!(" => intrinsic");
                     ty::InstanceDef::Intrinsic(def_id)
                 }
-                _ => {
-                    if Some(def_id) == tcx.lang_items().drop_in_place_fn() {
-                        let ty = substs.type_at(0);
-                        if ty.needs_drop(tcx, ty::ParamEnv::reveal_all()) {
-                            debug!(" => nontrivial drop glue");
-                            ty::InstanceDef::DropGlue(def_id, Some(ty))
-                        } else {
-                            debug!(" => trivial drop glue");
-                            ty::InstanceDef::DropGlue(def_id, None)
+                ty::FnDef(def_id, substs)
+                    if Some(def_id) == tcx.lang_items().drop_in_place_fn() =>
+                {
+                    let ty = substs.type_at(0);
+
+                    if ty.needs_drop(tcx, param_env) {
+                        // `DropGlue` requires a monomorphic aka concrete type.
+                        if ty.needs_subst() {
+                            return None;
                         }
+
+                        debug!(" => nontrivial drop glue");
+                        ty::InstanceDef::DropGlue(def_id, Some(ty))
                     } else {
-                        debug!(" => free item");
-                        ty::InstanceDef::Item(def_id)
+                        debug!(" => trivial drop glue");
+                        ty::InstanceDef::DropGlue(def_id, None)
                     }
+                }
+                _ => {
+                    debug!(" => free item");
+                    ty::InstanceDef::Item(def_id)
                 }
             };
             Some(Instance { def: def, substs: substs })
@@ -457,20 +480,44 @@ fn resolve_associated_item<'tcx>(
                 trait_closure_kind,
             ))
         }
-        traits::VtableFnPointer(ref data) => Some(Instance {
-            def: ty::InstanceDef::FnPtrShim(trait_item.def_id, data.fn_ty),
-            substs: rcvr_substs,
-        }),
+        traits::VtableFnPointer(ref data) => {
+            // `FnPtrShim` requires a monomorphic aka concrete type.
+            if data.fn_ty.needs_subst() {
+                return None;
+            }
+
+            Some(Instance {
+                def: ty::InstanceDef::FnPtrShim(trait_item.def_id, data.fn_ty),
+                substs: rcvr_substs,
+            })
+        }
         traits::VtableObject(ref data) => {
             let index = traits::get_vtable_index_of_object_method(tcx, data, def_id);
             Some(Instance { def: ty::InstanceDef::Virtual(def_id, index), substs: rcvr_substs })
         }
         traits::VtableBuiltin(..) => {
-            if tcx.lang_items().clone_trait().is_some() {
-                Some(Instance {
-                    def: ty::InstanceDef::CloneShim(def_id, trait_ref.self_ty()),
-                    substs: rcvr_substs,
-                })
+            if Some(trait_ref.def_id) == tcx.lang_items().clone_trait() {
+                // FIXME(eddyb) use lang items for methods instead of names.
+                let name = tcx.item_name(def_id);
+                if name == sym::clone {
+                    let self_ty = trait_ref.self_ty();
+
+                    // `CloneShim` requires a monomorphic aka concrete type.
+                    if self_ty.needs_subst() {
+                        return None;
+                    }
+
+                    Some(Instance {
+                        def: ty::InstanceDef::CloneShim(def_id, self_ty),
+                        substs: rcvr_substs,
+                    })
+                } else {
+                    assert_eq!(name, sym::clone_from);
+
+                    // Use the default `fn clone_from` from `trait Clone`.
+                    let substs = tcx.erase_regions(&rcvr_substs);
+                    Some(ty::Instance::new(def_id, substs))
+                }
             } else {
                 None
             }
